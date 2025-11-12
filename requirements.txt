@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+transformers>=4.46.0
+paddleocr
+paddlepaddle
+pdf2image
+Pillow
+aiohttp

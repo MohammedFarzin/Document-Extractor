@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+output/
+*.ckpt
+hf_cache/
+env
