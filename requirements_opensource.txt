@@ -25,7 +25,7 @@ timm>=0.9.12
 einops>=0.6.1
 
 # Model quantization (for memory optimization)
-bitsandbytes==0.43.1  # Requires CUDA
+bitsandbytes  # Requires CUDA
 
 # ====== Vision & Imaging ======
 pdf2image==1.16.3

@@ -5,33 +5,26 @@ Vision-language (VL) pipeline powered by Hugging Face models.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import base64
+import io
 import json
+import os
 import re
 from datetime import datetime
+
+import httpx
+import time
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import torch
 from pdf2image import convert_from_path
 from PIL import Image
-from transformers import AutoModelForCausalLM, AutoProcessor
+## Transformers not used in Ollama-only mode
 
-try:  # Optional model classes (available in transformers >= 4.46)
-    from transformers import Qwen2VLForConditionalGeneration
-except ImportError:  # pragma: no cover
-    Qwen2VLForConditionalGeneration = None
-
-try:  # Qwen2.5 VL
-    from transformers import Qwen2_5_VLForConditionalGeneration
-except ImportError:  # pragma: no cover
-    Qwen2_5_VLForConditionalGeneration = None
-
-try:  # Optional quantization
-    from transformers import BitsAndBytesConfig
-except ImportError:  # pragma: no cover
-    BitsAndBytesConfig = None
+DEFAULT_OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5vl:7b")
 
 
 class DocumentType(Enum):
@@ -56,19 +49,33 @@ class OpenSourceDocumentProcessor:
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        model_name: str = DEFAULT_OLLAMA_MODEL,
+        quantized_model_name: Optional[str] = None,
+        prefer_quantized: bool = False,
         categories: Optional[List[str]] = None,
         departments: Optional[List[str]] = None,
         device: str = "auto",
         use_gpu: bool = True,
         load_in_4bit: bool = False,
-        load_in_8bit: bool = True,
+        load_in_8bit: bool = False,
+        max_gpu_memory_gb: Optional[int] = None,
+        max_cpu_memory_gb: Optional[int] = None,
+        # Ollama backend
+        use_ollama: bool = True,
+        ollama_model: str = DEFAULT_OLLAMA_MODEL,
+        ollama_base_url: str = "http://localhost:11434",
+        ollama_timeout_s: int = 600,
+        ollama_keep_alive: str = "5m",
+        ollama_options: Optional[Dict[str, Any]] = None,
         confidence_threshold_auto: float = 0.95,
         confidence_threshold_review: float = 0.80,
-        max_pages: int = 3,
+        max_pages: int = 1,
         pdf_dpi: int = 280,
     ) -> None:
-        self.model_name = model_name
+        self.base_model_name = model_name
+        self.model_name = f"ollama:{ollama_model}"
+        self.quantized_model_name = quantized_model_name
+        self.prefer_quantized = prefer_quantized
         self.categories = categories or []
         self.departments = departments or []
         self.confidence_threshold_auto = confidence_threshold_auto
@@ -77,82 +84,53 @@ class OpenSourceDocumentProcessor:
         self.pdf_dpi = pdf_dpi
         self.load_in_4bit = load_in_4bit
         self.load_in_8bit = load_in_8bit
+        self.max_gpu_memory_gb = max_gpu_memory_gb
+        self.max_cpu_memory_gb = max_cpu_memory_gb
+        self.use_ollama = use_ollama
+        self.ollama_model = ollama_model
+        self.ollama_base_url = ollama_base_url.rstrip("/")
+        self.ollama_timeout_s = int(ollama_timeout_s)
+        self.ollama_keep_alive = ollama_keep_alive
+        self.ollama_options = ollama_options or {"num_predict": 512, "temperature": 0.0}
 
-        if device == "auto":
-            if torch.cuda.is_available() and use_gpu:
-                self.device = "cuda"
-            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available() and use_gpu:
-                self.device = "mps"
-            else:
-                self.device = "cpu"
-        else:
-            self.device = device
+        # Device selection not required for Ollama; set to CPU for logs
+        self.device = "cpu"
 
         print("🔧 Initializing Open Source Processor")
-        print(f"   Model: {model_name}")
+        print(f"   Base model: {self.base_model_name}")
+        if self.quantized_model_name:
+            print(f"   Quantized checkpoint: {self.quantized_model_name}")
+            print(f"   Prefer quantized: {self.prefer_quantized}")
         print(f"   Device: {self.device}")
         print(f"   8-bit quantization: {load_in_8bit}")
         print(f"   4-bit quantization: {load_in_4bit}")
+        if self.max_gpu_memory_gb:
+            print(f"   Max GPU memory per device: {self.max_gpu_memory_gb} GiB")
+        if self.max_cpu_memory_gb:
+            print(f"   Max CPU offload memory: {self.max_cpu_memory_gb} GiB")
+        print(f"   Backend: Ollama -> model={self.ollama_model} url={self.ollama_base_url}")
+        print(f"   Ollama timeout: {self.ollama_timeout_s}s, keep_alive: {self.ollama_keep_alive}")
 
+        # Initialize Ollama backend only
         self._init_vl_model()
         print("✅ Processor initialized successfully")
 
     def _init_vl_model(self) -> None:
-        print(f"📥 Loading model: {self.model_name} ...")
+        # Ollama-only path: verify server and model availability
+        self._verify_ollama_backend()
+        print("📥 Using Ollama backend; no Transformers model to load")
 
-        model_kwargs: Dict[str, object] = {"trust_remote_code": True}
-        load_in_8bit = self.load_in_8bit
-        load_in_4bit = self.load_in_4bit
-        is_cuda = self.device == "cuda"
-        wants_quant = (load_in_8bit or load_in_4bit) and is_cuda
+    def _quantization_available(self) -> bool:
+        # Not applicable in Ollama-only mode
+        return False
 
-        if wants_quant and BitsAndBytesConfig is None:
-            raise ImportError(
-                "bitsandbytes is required for 4/8-bit quantization on CUDA. Install bitsandbytes or disable quantization."
-            )
+    def _build_max_memory(self) -> Dict[object, str]:
+        # Not used in Ollama-only mode
+        return {}
 
-        if wants_quant:
-            model_kwargs["device_map"] = "auto"
-            if load_in_8bit:
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
-            elif load_in_4bit:
-                model_kwargs["quantization_config"] = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                )
-        else:
-            if self.device == "cuda":
-                model_kwargs["dtype"] = torch.bfloat16
-            elif self.device == "mps":
-                model_kwargs["dtype"] = torch.float16
-            else:
-                model_kwargs["dtype"] = torch.float32
-
-        self.processor = AutoProcessor.from_pretrained(self.model_name, trust_remote_code=True)
-
-        lower_name = self.model_name.lower()
-        model_cls = AutoModelForCausalLM
-        if any(key in lower_name for key in ("qwen2.5-vl", "qwen2_5-vl", "qwen2_5_vl")):
-            if Qwen2_5_VLForConditionalGeneration is None:
-                raise ImportError(
-                    "Qwen2_5_VLForConditionalGeneration unavailable. Upgrade transformers to >= 4.46."
-                )
-            model_cls = Qwen2_5_VLForConditionalGeneration
-        elif "qwen2-vl" in lower_name:
-            if Qwen2VLForConditionalGeneration is None:
-                raise ImportError(
-                    "Qwen2VLForConditionalGeneration unavailable. Upgrade transformers to >= 4.45."
-                )
-            model_cls = Qwen2VLForConditionalGeneration
-
-        self.model = model_cls.from_pretrained(self.model_name, **model_kwargs)
-
-        if not wants_quant and self.device in {"cpu", "mps"}:
-            self.model.to(self.device)
-
-        print("✅ Vision-language model loaded successfully")
+    def _cuda_supports_bfloat16(self) -> bool:
+        # Not applicable in Ollama-only mode
+        return False
 
     async def process_document(
         self,
@@ -218,35 +196,83 @@ class OpenSourceDocumentProcessor:
         return data, doc_type, language, vision_confidence
 
     def _run_vl_inference(self, prompt: str, images: List[Image.Image]) -> str:
-        message = {"role": "user", "content": [{"type": "text", "text": prompt}]}
-        for image in images:
-            message["content"].append({"type": "image", "image": image})
+        # Always route to Ollama
+        return self._run_ollama_inference(prompt, images)
 
-        chat_template = self.processor.apply_chat_template(
-            [message], add_generation_prompt=True, tokenize=False
-        )
-        inputs = self.processor(text=[chat_template], images=images, return_tensors="pt")
+    def _img_to_base64(self, image: Image.Image, format: str = "JPEG", quality: int = 85) -> str:
+        buf = io.BytesIO()
+        # Ensure RGB for JPEG; for PNG switch format and remove quality
+        img = image.convert("RGB") if format.upper() == "JPEG" else image
+        img.save(buf, format=format, quality=quality)
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("utf-8")
 
-        target_device = torch.device("cpu")
-        if self.device == "cuda":
-            target_device = torch.device("cuda")
-        elif self.device == "mps":
-            target_device = torch.device("mps")
+    def _run_ollama_inference(self, prompt: str, images: List[Image.Image]) -> str:
+        """Call Ollama with multimodal input via /api/generate only."""
+        img_b64 = [self._img_to_base64(img) for img in images]
 
-        for key, value in inputs.items():
-            if torch.is_tensor(value):
-                inputs[key] = value.to(target_device)
+        url = f"{self.ollama_base_url}/api/generate"
+        payload = {
+            "model": self.ollama_model,
+            "prompt": prompt,
+            "images": img_b64,
+            "stream": False,
+            "keep_alive": self.ollama_keep_alive,
+            "options": self.ollama_options,
+        }
+        timeout = httpx.Timeout(connect=30.0, read=self.ollama_timeout_s, write=30.0, pool=30.0)
+        attempts = 3
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    resp = client.post(url, json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+                break
+            except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.ConnectError, httpx.RemoteProtocolError) as exc:
+                last_exc = exc
+                if attempt < attempts:
+                    sleep_s = 1.5 ** (attempt - 1)
+                    print(f"   ⚠️ Ollama request timeout/connection issue. Retrying in {sleep_s:.1f}s (attempt {attempt}/{attempts})")
+                    time.sleep(sleep_s)
+                    continue
+                raise RuntimeError(f"Ollama /api/generate timed out after {attempts} attempts") from exc
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code if exc.response is not None else "unknown"
+                body = exc.response.text if exc.response is not None else ""
+                raise RuntimeError(f"Ollama /api/generate failed: {status} {body}") from exc
 
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=1200,
-                temperature=0.0,
-                do_sample=False,
+        text = data.get("response") or data.get("output") or ""
+        if not text:
+            raise RuntimeError("Empty response from Ollama /api/generate")
+        return text
+
+    def _verify_ollama_backend(self) -> None:
+        """Ensure the Ollama server is reachable and the requested model exists."""
+        version_url = f"{self.ollama_base_url}/api/version"
+        tags_url = f"{self.ollama_base_url}/api/tags"
+        try:
+            with httpx.Client(timeout=10) as client:
+                version_resp = client.get(version_url)
+                version_resp.raise_for_status()
+                tags_resp = client.get(tags_url)
+                tags_resp.raise_for_status()
+                models = tags_resp.json().get("models", [])
+        except Exception as exc:  # pragma: no cover - network guard
+            raise RuntimeError(
+                f"Unable to reach Ollama server at {self.ollama_base_url}; "
+                f"ensure 'ollama serve' is running. Details: {exc}"
+            ) from exc
+
+        available = {model.get("name") for model in models if model.get("name")}
+        if self.ollama_model not in available:
+            hint = ", ".join(sorted(available)) if available else "none"
+            print(
+                f"⚠️  Ollama model '{self.ollama_model}' not found on the server. "
+                f"Available models: {hint or '[]'}. "
+                f"Run `ollama pull {self.ollama_model}` on the host if needed."
             )
-
-        response = self.processor.batch_decode(output_ids, skip_special_tokens=True)[0]
-        return response
 
     def _load_document_images(self, file_path: str) -> List[Image.Image]:
         suffix = Path(file_path).suffix.lower()
@@ -545,7 +571,54 @@ Rules:
         return f"DOC_{datetime.now().strftime('%Y%m%d%H%M%S')}_{id(self) % 10000}"
 
 
+async def process_folder(
+    processor: OpenSourceDocumentProcessor,
+    input_dir: str,
+    output_dir: str,
+    user_id: str,
+    limit: Optional[int] = None,
+) -> None:
+    """Batch process supported documents in a folder tree."""
+    exts = {".pdf", ".png", ".jpg", ".jpeg"}
+    input_path = Path(input_dir)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Batch input directory not found: {input_dir}")
+
+    files: List[Path] = []
+    for candidate in sorted(input_path.rglob("*")):
+        if candidate.is_file() and candidate.suffix.lower() in exts:
+            files.append(candidate)
+            if limit is not None and len(files) >= limit:
+                break
+
+    if not files:
+        raise FileNotFoundError(f"No supported documents found under {input_dir}")
+
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for file_path in files:
+        print(f"Processing {file_path} ...")
+        result = await processor.process_document(str(file_path), user_id=user_id)
+        out_path = out_dir / f"{file_path.stem}_result.json"
+        out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  -> saved {out_path}")
+
+
 async def main() -> None:
+    parser = argparse.ArgumentParser(description="ERP Archive document processor")
+    parser.add_argument("--file", "-f", default="samples/invoice/invoice_1.png", help="Single document to process")
+    parser.add_argument("--batch-dir", "-b", help="Process all supported documents under this directory")
+    parser.add_argument("--output-dir", "-o", default="output", help="Directory for JSON outputs")
+    parser.add_argument("--user-id", default="demo_user", help="User identifier for metadata")
+    parser.add_argument("--limit", type=int, help="Optional max number of files when batching")
+    parser.add_argument("--ollama-timeout-s", type=int, default=int(os.environ.get("OLLAMA_TIMEOUT_S", "600")), help="Read timeout seconds for Ollama requests")
+    parser.add_argument("--ollama-keep-alive", default=os.environ.get("OLLAMA_KEEP_ALIVE", "5m"), help="How long to keep model loaded in Ollama (e.g., 5m, 1h)")
+    parser.add_argument("--ollama-num-predict", type=int, default=int(os.environ.get("OLLAMA_NUM_PREDICT", "512")), help="Max tokens to predict (testing)")
+    parser.add_argument("--max-pages", type=int, default=1, help="Max pages to OCR per document")
+    parser.add_argument("--pdf-dpi", type=int, default=280, help="DPI when rasterizing PDFs")
+    args = parser.parse_args()
+
     categories = [
         "Financial Documents",
         "Legal Documents",
@@ -554,24 +627,47 @@ async def main() -> None:
     ]
     departments = ["Finance", "Legal", "HR", "Operations"]
 
+    # Toggle Ollama via env to enable Qwen2-VL 7B (4-bit) served locally
+    use_ollama_env = os.environ.get("USE_OLLAMA", "true").lower() in {"1", "true", "yes"}
+    ollama_model_env = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+    ollama_base_env = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+
     processor = OpenSourceDocumentProcessor(
-        model_name="Qwen/Qwen2.5-VL-7B-Instruct",
+        model_name=DEFAULT_OLLAMA_MODEL,
         categories=categories,
         departments=departments,
         use_gpu=True,
-        load_in_8bit=True,
+        load_in_8bit=False,
         load_in_4bit=False,
+        max_pages=args.max_pages,
+        pdf_dpi=args.pdf_dpi,
+        use_ollama=use_ollama_env,
+        ollama_model=ollama_model_env,
+        ollama_base_url=ollama_base_env,
+        ollama_timeout_s=args.ollama_timeout_s,
+        ollama_keep_alive=args.ollama_keep_alive,
+        ollama_options={"num_predict": args.ollama_num_predict, "temperature": 0.0},
     )
 
-    file_path = "samples/invoice/example.png"
-    result = await processor.process_document(file_path=file_path, user_id="demo_user")
-
-    out_dir = Path("output")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"{Path(file_path).stem}_result.json"
-    with out_path.open("w", encoding="utf-8") as handle:
-        json.dump(result, handle, ensure_ascii=False, indent=2)
-    print(f"Saved result to {out_path}")
+    if args.batch_dir:
+        await process_folder(
+            processor=processor,
+            input_dir=args.batch_dir,
+            output_dir=args.output_dir,
+            user_id=args.user_id,
+            limit=args.limit,
+        )
+    else:
+        file_path = Path(args.file)
+        if not file_path.is_file():
+            raise FileNotFoundError(f"Input file not found: {file_path}")
+        result = await processor.process_document(file_path=str(file_path), user_id=args.user_id)
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{file_path.stem}_result.json"
+        with out_path.open("w", encoding="utf-8") as handle:
+            json.dump(result, handle, ensure_ascii=False, indent=2)
+        print(f"Saved result to {out_path}")
 
 
 if __name__ == "__main__":
